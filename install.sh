@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")"
+echo "⬇ 下载备份文件..."
+curl -L -o /root/dujiao_full_backup.tar.gz \
+https://raw.githubusercontent.com/shenping1200/recover_dujiaoka/main/dujiao_full_backup_2026-03-03_064139.tar.gz
 
-# 复制备份到 /root
-cp -f ./dujiao_full_backup_*.tar.gz /root/
+echo "⬇ 下载恢复脚本..."
+curl -L -o /root/restore_dujiao_universal.sh \
+https://raw.githubusercontent.com/shenping1200/recover_dujiaoka/main/restore_dujiao_universal.sh
 
-# 复制恢复脚本到 /root
-cp -f ./restore_dujiao_universal.sh /root/restore_dujiao_universal.sh
 chmod +x /root/restore_dujiao_universal.sh
 
-echo "✅ 已准备完成："
-echo "1) 备份 -> /root/dujiao_full_backup_*.tar.gz"
-echo "2) 脚本 -> /root/restore_dujiao_universal.sh"
-echo ""
-echo "下一步执行："
-echo "/root/restore_dujiao_universal.sh"
+echo "🚀 开始恢复..."
+/root/restore_dujiao_universal.sh
