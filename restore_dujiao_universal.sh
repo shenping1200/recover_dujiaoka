@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="Dujiao Restore Script v3.0 PRO"
+VERSION="Dujiao Restore Script v3.1 PRO"
 START_TIME=$(date +%s)
 
 GREEN="\033[32m"
@@ -17,9 +17,35 @@ DOM_ADMIN="pay.yufu120.de5.net"
 LE_LIVE="/etc/letsencrypt/live/${DOM_MAIN}"
 CRONFILE="/etc/cron.d/certbot-renew"
 
-echo -e "${BLUE}========================================${RESET}"
+echo -e "${BLUE}====================================${RESET}"
 echo -e "${BLUE}${VERSION}${RESET}"
-echo -e "${BLUE}========================================${RESET}"
+echo -e "${BLUE}====================================${RESET}"
+
+install_docker_if_needed() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}🐳 未检测到 Docker，开始自动安装...${RESET}"
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y ca-certificates curl gnupg lsb-release
+
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io
+
+    systemctl enable docker >/dev/null 2>&1 || true
+    systemctl start docker  >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✅ Docker 安装完成${RESET}"
+  else
+    echo -e "${GREEN}✅ Docker 已安装${RESET}"
+  fi
+}
 
 detect_public_ip() {
   curl -4 -fsS https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}'
@@ -27,160 +53,132 @@ detect_public_ip() {
 
 port_check() {
   if ss -lnt | grep -qE ':(80|443)\b'; then
-    echo -e "${YELLOW}⚠ 80或443端口已被占用${RESET}"
-    ss -lnt | grep -E ':(80|443)\b'
-  else
-    echo -e "${GREEN}✅ 80/443端口空闲${RESET}"
+    echo -e "${YELLOW}⚠ 80/443 端口已被占用：${RESET}"
+    ss -lnt | grep -E ':(80|443)\b' || true
+    echo -e "${RED}请先释放 80/443 后再恢复（或用测试模式不启动网关）${RESET}"
+    exit 1
+  fi
+  echo -e "${GREEN}✓ 80/443 端口空闲${RESET}"
+}
+
+ensure_network() {
+  if ! docker network ls --format '{{.Name}}' | grep -qx "$NET"; then
+    docker network create "$NET" >/dev/null
   fi
 }
 
-safe_rm(){ docker rm -f "$1" >/dev/null 2>&1 || true; }
-
-ensure_network(){
-  docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
-}
-
-ensure_certbot(){
-  command -v certbot >/dev/null 2>&1 || (apt-get update -y >/dev/null && apt-get install -y certbot >/dev/null)
-}
-
-ensure_certificate(){
-  if [[ -f "${LE_LIVE}/fullchain.pem" ]]; then
-    echo -e "${GREEN}✅ 发现现有证书${RESET}"
-  else
-    echo -e "${YELLOW}⚠ 未发现证书，开始自动申请${RESET}"
-    ensure_certbot
-    timeout 120 certbot certonly \
-      --standalone \
-      --non-interactive \
-      --agree-tos \
-      --register-unsafely-without-email \
-      --preferred-challenges http \
-      --keep-until-expiring \
-      -d "${DOM_MAIN}" \
-      -d "${DOM_ADMIN}" \
-      --quiet || {
-        echo -e "${RED}❌ 证书申请失败（请确认DNS已指向本机）${RESET}"
-        exit 1
-      }
-    echo -e "${GREEN}✅ 证书申请完成${RESET}"
+redis_alias_fix() {
+  # 确保 redis 容器在网络内带 alias=redis，避免 lookup redis 失败
+  if docker ps --format '{{.Names}}' | grep -qx "dujiao-next-redis-1"; then
+    docker network disconnect "$NET" dujiao-next-redis-1 >/dev/null 2>&1 || true
+    docker network connect --alias redis "$NET" dujiao-next-redis-1 >/dev/null 2>&1 || true
   fi
 }
 
-ensure_cron(){
-  ensure_certbot
-  cat >"$CRONFILE" <<CRON
+ensure_certificate() {
+  # 如果你是“迁移自用”，通常会带着 /etc/letsencrypt 过来，这里只做检查提示
+  if [[ -f "${LE_LIVE}/fullchain.pem" && -f "${LE_LIVE}/privkey.pem" ]]; then
+    echo -e "${GREEN}✓ 发现现有证书${RESET}"
+  else
+    echo -e "${YELLOW}⚠ 未发现现有证书：${LE_LIVE}${RESET}"
+    echo -e "${YELLOW}   你需要先把域名解析到本机，再手动申请证书（或把旧证书备份带过来）${RESET}"
+  fi
+}
+
+ensure_cron() {
+  # 配置每天 03:10 自动续签（续签时停/启网关释放 80）
+  cat >"$CRONFILE" <<'EOF'
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 10 3 * * * root certbot renew --quiet \
---pre-hook "docker stop dujiao-gw >/dev/null 2>&1 || true" \
---post-hook "docker start dujiao-gw >/dev/null 2>&1 || true"
-CRON
+  --pre-hook "docker stop dujiao-gw >/dev/null 2>&1 || true" \
+  --post-hook "docker start dujiao-gw >/dev/null 2>&1 || true"
+EOF
   chmod 644 "$CRONFILE"
-  systemctl restart cron 2>/dev/null || true
-  echo -e "${GREEN}✅ 续签任务已写入${RESET}"
+  systemctl restart cron >/dev/null 2>&1 || true
+  echo -e "${GREEN}✓ 已配置续签任务：${CRONFILE}${RESET}"
 }
 
-redis_alias_fix(){
-  docker network disconnect "$NET" dujiao-next-redis-1 >/dev/null 2>&1 || true
-  docker network connect --alias redis "$NET" dujiao-next-redis-1 >/dev/null 2>&1 || true
-  docker restart dujiao-next-api-1 >/dev/null 2>&1 || true
-  echo -e "${GREEN}✅ Redis alias已修复${RESET}"
+restore_files() {
+  # 找备份包（兼容你的两种命名）
+  local BK=""
+  BK="$(ls -1 /root/dujiao_full_backup*.tar.gz 2>/dev/null | head -n1 || true)"
+  if [[ -z "$BK" ]]; then
+    echo -e "${RED}❌ 未找到备份包：/root/dujiao_full_backup*.tar.gz${RESET}"
+    exit 1
+  fi
+
+  echo -e "${BLUE}📦 使用备份包：$BK${RESET}"
+  tar -xzf "$BK" -C /
+  echo -e "${GREEN}✓ 文件已解压到系统目录${RESET}"
 }
 
-while true; do
-  echo ""
-  echo "1) 稳定增强版"
-  echo "2) 迁移/测试模式"
-  echo "3) 安全模式"
-  echo "0) 退出"
-  read -p "请选择: " MODE
-  case "$MODE" in
-    1|2|3) break ;;
-    0) exit 0 ;;
-    *) echo "无效输入";;
-  esac
-done
+pull_images() {
+  docker pull nginx:alpine >/dev/null
+  docker pull redis:7-alpine >/dev/null
+  docker pull dujiaonext/api:latest >/dev/null
+  docker pull dujiaonext/user:latest >/dev/null
+  docker pull dujiaonext/admin:latest >/dev/null
+  docker pull dapiaoliang666/tokenpay:latest >/dev/null
+}
 
-while true; do
-  echo ""
-  echo "1) 使用原始URL"
-  echo "2) 自动使用公网IP"
-  echo "3) 手动输入URL"
-  echo "4) 不修改URL"
-  echo "0) 返回上一级"
-  read -p "请选择: " URL_MODE
-  case "$URL_MODE" in
-    1|2|3|4) break ;;
-    0) exec "$0" ;;
-    *) echo "无效输入";;
-  esac
-done
+start_containers() {
+  ensure_network
 
-NEW_URL=""
-if [[ "$URL_MODE" == "2" ]]; then
-  IP=$(detect_public_ip)
-  NEW_URL="http://${IP}:8082"
-elif [[ "$URL_MODE" == "3" ]]; then
-  read -p "输入URL: " NEW_URL
-fi
+  # 清理同名容器（避免重复）
+  docker rm -f dujiao-next-redis-1 dujiao-next-api-1 dujiao-next-user-1 dujiao-next-admin-1 tokenpay dujiao-gw >/dev/null 2>&1 || true
 
-echo -e "${BLUE}== 开始恢复 ==${RESET}"
+  docker run -d --name dujiao-next-redis-1 --network "$NET" --network-alias redis \
+    -v /opt/dujiao-next/data/redis:/data redis:7-alpine >/dev/null
 
-BACKUP=$(ls -t /root/dujiao_full_backup_*.tar.gz 2>/dev/null | head -n1)
-[[ -f "$BACKUP" ]] || { echo -e "${RED}未找到备份文件${RESET}"; exit 1; }
+  docker run -d --name dujiao-next-api-1 --network "$NET" -p 8080:8080 \
+    -v /opt/dujiao-next/data/logs:/app/logs \
+    -v /opt/dujiao-next/config/config.yml:/app/config.yml:ro \
+    -v /opt/dujiao-next/data/db:/app/db \
+    -v /opt/dujiao-next/data/uploads:/app/uploads \
+    dujiaonext/api:latest >/dev/null
 
-safe_rm dujiao-gw
-safe_rm tokenpay
-safe_rm dujiao-next-admin-1
-safe_rm dujiao-next-user-1
-safe_rm dujiao-next-api-1
-safe_rm dujiao-next-redis-1
+  docker run -d --name dujiao-next-user-1 --network "$NET" -p 8081:80 \
+    dujiaonext/user:latest >/dev/null
 
-tar -xzf "$BACKUP" -C /
+  docker run -d --name dujiao-next-admin-1 --network "$NET" -p 8082:80 \
+    dujiaonext/admin:latest >/dev/null
 
-if [[ -n "$NEW_URL" && -f "$CFG" ]]; then
-  sed -i -E "s|^[[:space:]]*url:[[:space:]]*.*$|url: ${NEW_URL}|" "$CFG"
-fi
+  docker run -d --name tokenpay --network "$NET" -p 52939:8080 \
+    -v /opt/tokenpay:/data \
+    -v /opt/tokenpay/appsettings.json:/app/appsettings.json \
+    dapiaoliang666/tokenpay:latest >/dev/null
 
-docker pull nginx:alpine >/dev/null
-docker pull redis:7-alpine >/dev/null
-docker pull dujiaonext/api:latest >/dev/null
-docker pull dujiaonext/user:latest >/dev/null
-docker pull dujiaonext/admin:latest >/dev/null
-docker pull dapiaoliang666/tokenpay:latest >/dev/null
+  redis_alias_fix
+}
 
-ensure_network
-port_check
+start_gateway_if_possible() {
+  # 网关需要 80/443 空闲
+  port_check
 
-docker run -d --name dujiao-next-redis-1 --network "$NET" --network-alias redis -v /opt/dujiao-next/data/redis:/data redis:7-alpine >/dev/null
-docker run -d --name dujiao-next-api-1 --network "$NET" -p 8080:8080 \
-  -v /opt/dujiao-next/data/logs:/app/logs \
-  -v /opt/dujiao-next/config/config.yml:/app/config.yml:ro \
-  -v /opt/dujiao-next/data/db:/app/db \
-  -v /opt/dujiao-next/data/uploads:/app/uploads \
-  dujiaonext/api:latest >/dev/null
-
-docker run -d --name dujiao-next-user-1 --network "$NET" -p 8081:80 dujiaonext/user:latest >/dev/null
-docker run -d --name dujiao-next-admin-1 --network "$NET" -p 8082:80 dujiaonext/admin:latest >/dev/null
-docker run -d --name tokenpay --network "$NET" -p 52939:8080 \
-  -v /opt/tokenpay:/data \
-  -v /opt/tokenpay/appsettings.json:/app/appsettings.json \
-  dapiaoliang666/tokenpay:latest >/dev/null
-
-redis_alias_fix
-
-if [[ "$MODE" == "1" ]]; then
-  ensure_certificate
-  ensure_cron
   docker run -d --name dujiao-gw --network "$NET" -p 80:80 -p 443:443 \
     -v /opt/dujiao-gw/nginx.conf:/etc/nginx/conf.d/default.conf:ro \
-    -v /etc/letsencrypt:/etc/letsencrypt:ro nginx:alpine >/dev/null
-fi
+    -v /etc/letsencrypt:/etc/letsencrypt:ro \
+    nginx:alpine >/dev/null
+}
 
-echo -e "${GREEN}恢复完成${RESET}"
-docker ps
+main() {
+  install_docker_if_needed
+  restore_files
+  pull_images
+  start_containers
 
-END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
-echo -e "${BLUE}总耗时: ${ELAPSED} 秒${RESET}"
+  # 默认：稳定增强版（自用迁移）= 启动网关 + 证书检查 + 续签任务
+  ensure_certificate
+  ensure_cron
+  start_gateway_if_possible
+
+  echo -e "${GREEN}✅ 恢复完成${RESET}"
+  docker ps
+
+  END_TIME=$(date +%s)
+  ELAPSED=$((END_TIME - START_TIME))
+  echo -e "${BLUE}总耗时：${ELAPSED} 秒${RESET}"
+}
+
+main "$@"
